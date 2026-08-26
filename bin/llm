@@ -576,14 +576,14 @@ build_payload_openrouter() {
         --arg only "$LLM_OR_ONLY" \
         --arg dc "$LLM_OR_DATA_COLLECTION" \
         --arg zdr "$LLM_OR_ZDR" \
-        '. + {provider:
-                (if $only != "" then
-                     {only: ($only | ascii_downcase | split(",")
-                             | map(gsub("[[:space:]]"; "")) | map(select(length > 0))),
-                      allow_fallbacks: false}
-                 else {} end)
-                + (if $dc != "" then {data_collection: $dc} else {} end)
-                + (if $zdr == "1" then {zdr: true} else {} end)}'
+        '((if $only != "" then
+               {only: ($only | ascii_downcase | split(",")
+                       | map(gsub("[[:space:]]"; "")) | map(select(length > 0))),
+                allow_fallbacks: false}
+           else {} end)
+          + (if $dc != "" then {data_collection: $dc} else {} end)
+          + (if $zdr == "1" then {zdr: true} else {} end)) as $p
+         | . + {provider: $p}'
 }
 
 # Verify the host that actually served the response against
