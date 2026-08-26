@@ -44,6 +44,29 @@ LLM_THINKING_LEVEL=""
 LLM_EFFORT=""
 LLM_RAW=0
 LLM_PROMPT=""
+# OpenRouter provider routing. OpenRouter fans a single model id out over
+# several hosts (openai/gpt-5.6-luna is served by OpenAI, Azure and Amazon
+# Bedrock), and picks one per request. Where the data may be sent is therefore
+# a routing decision, not a model choice, so it needs a knob:
+#   LLM_OR_ONLY               comma-separated provider slugs; emits
+#                             provider.only + allow_fallbacks:false. OpenRouter
+#                             enforces this server-side, returning 404 rather
+#                             than falling back, so an unsatisfiable pin fails
+#                             loudly instead of quietly rerouting.
+#   LLM_OR_DATA_COLLECTION    "deny" refuses hosts that train on the prompt.
+#   LLM_OR_ZDR                1 asks for zero-data-retention endpoints only.
+#                             Independent of the pin, and intersected with it:
+#                             a model whose only ZDR endpoint is a host the pin
+#                             excludes has no endpoints left and 404s.
+#   LLM_OR_REQUIRE_PROVIDER   allowlist verified against the provider the
+#                             response says actually served it. The flags above
+#                             are a request; this is the check that it was
+#                             honoured, and a mismatch is fatal and never
+#                             retried.
+LLM_OR_ONLY="${LLM_OR_ONLY:-}"
+LLM_OR_DATA_COLLECTION="${LLM_OR_DATA_COLLECTION:-}"
+LLM_OR_ZDR="${LLM_OR_ZDR:-0}"
+LLM_OR_REQUIRE_PROVIDER="${LLM_OR_REQUIRE_PROVIDER:-}"
 # Token usage is captured on every call. A caller that wants this call's
 # numbers sets LLM_USAGE_FILE and gets a one-line JSON record
 # ({in_tok, out_tok, think_tok}) written there after the call (bin/shellm
@@ -75,6 +98,24 @@ LLM_SPEED_TIME="${LLM_SPEED_TIME:-60}"
 # ---------------------------------------------------------------------------
 
 die() { echo "llm: error: $*" >&2; exit 1; }
+
+# A routing/residency failure is terminal. Every other pre-emission failure in
+# this script is retried, but retrying this one would re-send the same prompt
+# to the same wrongly-routed endpoint — the exact thing the caller asked not to
+# happen. The signal out of the stream handler's subshell is an exit code, not
+# a marker file, because an exit status cannot fail to be delivered: a marker
+# write lost to a vanished TMPDIR would silently downgrade this to a retry.
+die_residency() {
+    _llm_note error "" "residency: $*"
+    echo "llm: error: residency: $*" >&2
+    # 76 (EX_PROTOCOL) reaches the streaming retry gate; the non-streaming path
+    # has no gate above it and exits plainly.
+    if [[ -n "${LLM_RETRY_ERR:-}" ]]; then
+        printf '%s' "residency: $*" > "$LLM_RETRY_ERR" 2>/dev/null || true
+        exit 76
+    fi
+    exit 1
+}
 
 # Last-call health marker: one small JSON in the state home, rewritten after
 # every call, so `ada status`, status.sh and the dash can say "your key ran
@@ -147,6 +188,10 @@ Options:
   -M, --messages JSON      Messages array JSON, e.g. [{"role":"user","content":"hi"}]
   --no-stream              Disable streaming (streaming is on by default)
   --provider NAME          Provider: anthropic, openai, gemini, or openrouter
+  --or-only SLUGS          OpenRouter: pin routing to these provider slugs
+  --or-data-collection X   OpenRouter: "deny" to refuse training hosts
+  --or-zdr                 OpenRouter: zero-data-retention endpoints only
+  --or-require-provider S  Fail unless served by one of these slugs
   --thinking [LEVEL]       Enable thinking (Anthropic: adaptive; Gemini: minimal/low/medium/high)
   --effort LEVEL           Thinking effort/provider output effort
   --raw                    Print raw non-streaming API response JSON
@@ -192,6 +237,8 @@ Environment:
   OPENAI_API_KEY           Required for OpenAI models
   GEMINI_API_KEY           Required for Gemini models
   OPENROUTER_API_KEY       Required for OpenRouter models
+  LLM_OR_ONLY, LLM_OR_DATA_COLLECTION, LLM_OR_ZDR, LLM_OR_REQUIRE_PROVIDER
+                           Defaults for the matching --or-* flags
   LLM_API_URL              Override provider API URL
   LLM_RETRIES              Retries for transient API failures (default: 2;
                            0 disables). Never retries after partial output.
@@ -229,6 +276,10 @@ while [[ $# -gt 0 ]]; do
         --stream)        LLM_STREAM=1; shift ;;
         --no-stream)     LLM_STREAM=0; shift ;;
         --provider)      LLM_PROVIDER="${2:?--provider requires a value}"; shift 2 ;;
+        --or-only)       LLM_OR_ONLY="${2:?--or-only requires a value}"; shift 2 ;;
+        --or-data-collection) LLM_OR_DATA_COLLECTION="${2:?--or-data-collection requires a value}"; shift 2 ;;
+        --or-zdr)        LLM_OR_ZDR=1; shift ;;
+        --or-require-provider) LLM_OR_REQUIRE_PROVIDER="${2:?--or-require-provider requires a value}"; shift 2 ;;
         --thinking)
             LLM_THINKING=1
             if [[ -n "${2:-}" && "$2" != -* ]]; then
@@ -289,6 +340,25 @@ detect_provider() {
 
 if [[ -z "$LLM_PROVIDER" ]]; then
     LLM_PROVIDER=$(detect_provider "$LLM_MODEL")
+fi
+
+# The LLM_OR_* knobs are OpenRouter routing controls and mean nothing to the
+# other providers, whose responses carry no provider attribution to check. Drop
+# them out loud rather than either silently ignoring a residency requirement or
+# failing a direct provider call for not answering a question it was never
+# asked.
+# A residency requirement that cannot be evaluated is fatal, not a warning: no
+# other provider's response carries the attribution to check, so honouring it is
+# impossible and silently voiding it is the one fail-open seam worth closing.
+# The routing preferences alone are merely inapplicable, so those warn and clear
+# — a stray LLM_OR_ZDR in a shell profile must not kill every Anthropic call.
+if [[ "$LLM_PROVIDER" != "openrouter" && -n "$LLM_OR_REQUIRE_PROVIDER" ]]; then
+    die "--or-require-provider/LLM_OR_REQUIRE_PROVIDER cannot be checked for provider '$LLM_PROVIDER' (OpenRouter only)"
+fi
+if [[ "$LLM_PROVIDER" != "openrouter" && ( "$LLM_OR_ZDR" == "1" \
+      || -n "$LLM_OR_ONLY$LLM_OR_DATA_COLLECTION" ) ]]; then
+    echo "llm: warning: LLM_OR_*/--or-* are OpenRouter-only and ignored for provider '$LLM_PROVIDER'" >&2
+    LLM_OR_ONLY=""; LLM_OR_DATA_COLLECTION=""; LLM_OR_ZDR=0
 fi
 
 # Per-model max output token caps (synchronous APIs, no beta headers).
@@ -493,8 +563,53 @@ build_payload_gemini() {
     printf '%s' "$contents" | jq "${jq_args[@]}" "$jq_filter"
 }
 
-# OpenRouter is OpenAI-compatible (chat/completions wire format)
-build_payload_openrouter() { build_payload_openai; }
+# OpenRouter is OpenAI-compatible (chat/completions wire format), plus an
+# optional "provider" object carrying the routing preferences above. Absent
+# that object OpenRouter is free to pick any host serving the model.
+build_payload_openrouter() {
+    # Unpinned callers pay nothing: no extra jq pass, byte-identical to before.
+    if [[ -z "$LLM_OR_ONLY$LLM_OR_DATA_COLLECTION" && "$LLM_OR_ZDR" != "1" ]]; then
+        build_payload_openai
+        return
+    fi
+    build_payload_openai | jq -c \
+        --arg only "$LLM_OR_ONLY" \
+        --arg dc "$LLM_OR_DATA_COLLECTION" \
+        --arg zdr "$LLM_OR_ZDR" \
+        '. + {provider:
+                (if $only != "" then
+                     {only: ($only | ascii_downcase | split(",")
+                             | map(gsub("[[:space:]]"; "")) | map(select(length > 0))),
+                      allow_fallbacks: false}
+                 else {} end)
+                + (if $dc != "" then {data_collection: $dc} else {} end)
+                + (if $zdr == "1" then {zdr: true} else {} end)}'
+}
+
+# Verify the host that actually served the response against
+# LLM_OR_REQUIRE_PROVIDER. Slugs are matched case-insensitively, and a bare
+# "openai" also accepts its tiered variants ("openai/flex", "openai/priority")
+# since those are the same host. Prints a failure line, or nothing when the
+# response is acceptable (or when no requirement is configured).
+or_provider_failure() {   # $1 = provider string the response reported
+    local served="$1" lc list
+    [[ -z "$LLM_OR_REQUIRE_PROVIDER" ]] && return 0
+    if [[ -z "$served" ]]; then
+        printf 'response carried no provider attribution to check against LLM_OR_REQUIRE_PROVIDER=%s' \
+            "$LLM_OR_REQUIRE_PROVIDER"
+        return 0
+    fi
+    lc=$(printf '%s' "$served" | tr '[:upper:]' '[:lower:]')
+    # Comma-pad both sides so a whole-element match is a plain glob. Pad in the
+    # printf, before squeezing: squeezing first would let a served "/x" match a
+    # doubled comma. The second test lets a bare "openai" accept its tiered
+    # variants ("openai/flex"), which are the same host.
+    list=$(printf ',%s,' "$LLM_OR_REQUIRE_PROVIDER" \
+           | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' | tr -s ,)
+    [[ "$list" == *,"$lc",* || "$list" == *,"${lc%%/*}",* ]] && return 0
+    printf 'served by "%s", which is not in LLM_OR_REQUIRE_PROVIDER=%s' \
+        "$served" "$LLM_OR_REQUIRE_PROVIDER"
+}
 
 # ---------------------------------------------------------------------------
 # URL and headers per provider
@@ -727,13 +842,27 @@ stream_anthropic() {
 }
 
 stream_openai() {
-    local _saw_data=0 _err_buf="" _chunk=""
+    local _saw_data=0 _err_buf="" _chunk="" _prov_ok=0
     while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
         local line="${raw_line%$'\r'}"
         if [[ "$line" == data:\ * ]]; then
             _saw_data=1
             local json="${line#data: }"
             [[ "$json" == "[DONE]" ]] && continue
+            # Residency check, before any of this chunk reaches stdout: every
+            # OpenRouter chunk repeats the serving provider, so the first one
+            # settles it. The glob keeps jq off the hot per-delta path once
+            # the check has passed.
+            if [[ -n "$LLM_OR_REQUIRE_PROVIDER" && "$_prov_ok" -eq 0 \
+                  && "$json" == *'"provider":"'* ]]; then
+                local _served _pfail
+                _served=$(printf '%s' "$json" | jq -r '.provider // empty' 2>/dev/null) || _served=""
+                if [[ -n "$_served" ]]; then
+                    _pfail=$(or_provider_failure "$_served")
+                    [[ -n "$_pfail" ]] && die_residency "$_pfail"
+                    _prov_ok=1
+                fi
+            fi
             # The trailing X is load-bearing: command substitution strips
             # trailing newlines, so a delta of "\n" would arrive here as the
             # empty string and be dropped by the -n guard below, and a delta
@@ -773,6 +902,12 @@ stream_openai() {
         fi
     done
     _die_if_no_stream_data
+    # Fail closed: a stream that carried data but never said who served it
+    # cannot be shown to have honoured the pin, so it is a failure rather than
+    # an unchecked pass.
+    if [[ -n "$LLM_OR_REQUIRE_PROVIDER" && "$_saw_data" -eq 1 && "$_prov_ok" -eq 0 ]]; then
+        die_residency "stream $(or_provider_failure "")"
+    fi
 }
 
 stream_gemini() {
@@ -901,6 +1036,8 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
             _retry_msg="empty response: stream ended without emitting anything"
             _rc=1
         fi
+        # Residency failures are never retried (see die_residency).
+        [[ "$_rc" -eq 76 ]] && exit 1
         if [[ "$_emitted" -eq 0 && "$_attempt" -lt "$_max_attempts" ]]; then
             echo "llm: transient API failure (attempt $_attempt/$_max_attempts): ${_retry_msg:-${_ce:-exit $_rc}} — retrying" >&2
             sleep $(( LLM_RETRY_BACKOFF * _attempt ))
@@ -962,6 +1099,16 @@ else
             die "API error (HTTP $http_code): $error_msg"
         fi
         die "API error (HTTP $http_code)"
+    fi
+    # Residency check, ahead of the ok health record: deliberately outside the
+    # retry loop above, because a mismatch is terminal rather than transient.
+    if [[ -n "$LLM_OR_REQUIRE_PROVIDER" ]]; then
+        _served=$(jq -r '.provider // empty' "$local_resp" 2>/dev/null) || _served=""
+        _pfail=$(or_provider_failure "$_served")
+        if [[ -n "$_pfail" ]]; then
+            rm -f "$local_resp"
+            die_residency "$_pfail"
+        fi
     fi
     _llm_note ok
 
